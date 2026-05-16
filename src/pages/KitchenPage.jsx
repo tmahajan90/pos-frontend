@@ -26,19 +26,63 @@ const nextLabel = {
 };
 
 export default function KitchenPage() {
+
+  // Debug: log user and token
+  const { isOnline, triggerSync, syncing } = useOffline();
+  const { user } = useAuth();
+  console.log("KitchenPage: user", user);
+  console.log("KitchenPage: auth_token", localStorage.getItem("auth_token"));
   const [orders, setOrders] = useState([]);
   const [staffMap, setStaffMap] = useState({});
   const [tableMap, setTableMap] = useState({});
   const [productMap, setProductMap] = useState({});
   const [filter, setFilter] = useState("all");
-  const { isOnline, triggerSync, syncing } = useOffline();
-  const { user } = useAuth();
 
-  const canUpdateKitchenStatus = user?.role !== "staff";
+  // Manager, chef, kitchen, and admin can update. Only staff cannot.
+  const canUpdateKitchenStatus = user && user.role && user.role !== "staff";
 
+
+  // Always force a server fetch after hard refresh to update local DB
   const loadKitchen = useCallback(async () => {
-    const allOrders = await db.orders.toArray();
-    const openOrders = allOrders.filter((o) => o.status === "draft" || o.status === "confirmed");
+    let allOrders = [];
+    if (isOnline) {
+      try {
+        const { default: api } = await import("../services/api");
+        let serverOrders = [];
+        try {
+          serverOrders = await api.get("/api/orders?status=draft,confirmed");
+        } catch {
+          const allServerOrders = await api.get("/api/orders");
+          serverOrders = allServerOrders.filter((o) => o.status === "draft" || o.status === "confirmed");
+        }
+        if (Array.isArray(serverOrders)) {
+          // Overwrite local DB with server orders for freshness
+          await db.orders.clear();
+          for (const order of serverOrders) {
+            await db.orders.put({
+              id: order.id,
+              tenant_id: order.tenant_id,
+              user_id: order.user_id,
+              table_id: order.table_id || null,
+              assigned_staff_id: order.assigned_staff_id || null,
+              status: order.status,
+              kitchen_status: order.kitchen_status ?? 0,
+              total: parseFloat(order.total),
+              subtotal: parseFloat(order.subtotal ?? order.total ?? 0),
+              customer_name: order.customer_name,
+              customer_phone: order.customer_phone,
+              sync_status: "synced",
+              created_at: order.created_at,
+              updated_at: order.updated_at,
+            });
+          }
+        }
+      } catch (e) {
+        // offline, continue with local DB
+        console.warn("KitchenPage: Could not fetch orders from server", e);
+      }
+    }
+    allOrders = await db.orders.toArray();
 
     const items = await db.order_items.toArray();
     const itemsByOrder = {};
@@ -91,8 +135,14 @@ export default function KitchenPage() {
     if (isOnline) {
       try {
         const { syncService } = await import("../services/sync");
-        await syncService.pushPendingOrders();
-      } catch {}
+        const result = await syncService.pushPendingOrders();
+        if (result && result.errors && result.errors.length > 0) {
+          const errMsg = result.errors.map(e => `Order #${e.id}: ${e.errors.join(", ")}`).join("\n");
+          alert("Sync error:\n" + errMsg);
+        }
+      } catch (err) {
+        alert("Sync failed: " + (err?.message || err));
+      }
     }
     loadKitchen();
   };
@@ -164,6 +214,15 @@ export default function KitchenPage() {
           const ks = order.kitchen_status ?? 0;
           const cfg = statusConfig[ks] || statusConfig[0];
           const hasNext = nextStatus[ks] !== undefined;
+          // Debug log for button rendering
+          console.log("Order", order.id, {
+            userRole: user?.role,
+            canUpdateKitchenStatus,
+            ks,
+            hasNext,
+            orderStatus: order.status,
+            kitchen_status: order.kitchen_status,
+          });
           return (
             <div key={order.id} style={{ ...styles.ticket, background: cfg.bg, borderLeftColor: cfg.border }}>
               <div style={styles.ticketHeader}>
